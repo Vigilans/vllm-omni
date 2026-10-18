@@ -310,6 +310,8 @@ class DiffusionParallelConfig:
       of spatial tiles and the results are stitched on rank 0.
     - "batch": Decode complete images on different ranks, preserving their
       batch order. Requires AutoencoderKL/Flux2 and DP/PP/CFG sizes of 1.
+    - "tensor": H3 video-decoder projections are sharded over the full DiT TP
+      group. Every rank decodes the same tiles with partitioned weights.
     - "spatial_shard_height": Spatially-sharded decode that splits decoder
       feature maps along height and exchanges halo rows around spatial
       convolutions.
@@ -350,8 +352,9 @@ class DiffusionParallelConfig:
         assert self.allgather_degree > 0, "AllGather degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
         assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
-        assert self.vae_parallel_mode in {"tile", "batch", "spatial_shard_height", "spatial_shard_width"}, (
-            "vae_parallel_mode must be one of {'tile', 'batch', 'spatial_shard_height', 'spatial_shard_width'}, "
+        assert self.vae_parallel_mode in {"tile", "batch", "tensor", "spatial_shard_height", "spatial_shard_width"}, (
+            "vae_parallel_mode must be one of "
+            "{'tile', 'batch', 'tensor', 'spatial_shard_height', 'spatial_shard_width'}, "
             f"but got {self.vae_parallel_mode!r}."
         )
         if self.vae_parallel_mode == "batch" and (

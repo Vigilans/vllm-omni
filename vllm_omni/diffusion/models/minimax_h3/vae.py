@@ -330,7 +330,7 @@ class _VideoVAEPartProxy(nn.Module):
 
 
 class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
-    """Adapter around the checkpoint's native parallel-tiled video VAE."""
+    """Checkpoint video VAE with tile or decoder-weight tensor parallelism."""
 
     decode_dtype: torch.dtype = torch.float16
     _pixel_transform: Callable[[torch.Tensor], torch.Tensor] | None = None
@@ -345,6 +345,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         decode_only: bool = False,
         trust_remote_code: bool = False,
         decoder_source: str | Mapping[str, str] | None = None,
+        tensor_parallel_size: int = 1,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -362,6 +363,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self._pixel_transform = released_decoder_pixels if decoder_path is not None else None
         if self.encode_only and decoder_path is not None:
             raise ValueError("An encode-only VAE cannot load a replacement video decoder")
+        if tensor_parallel_size > 1 and decoder_path is not None:
+            raise ValueError("The NVFP4 video decoder cannot be sharded with tensor-parallel VAE weights")
         self.config_dict = _load_component_config(component_path)
         _check_trust_remote_code(component_path, self.config_dict, trust_remote_code)
         if self.encode_only:
@@ -370,6 +373,11 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             self.remote = _load_remote_component(component_path, self.config_dict, trust_remote_code=trust_remote_code)
             if self.decode_only:
                 _remove_modules(self.remote.model, ("encoder", "quant_conv"))
+        self.tensor_parallel_size = tensor_parallel_size
+        if tensor_parallel_size > 1:
+            from .vae_tensor_parallel import shard_video_decoder
+
+            shard_video_decoder(self.remote.model.decoder, tensor_parallel_size)
         # Match the reference loader contract before installing inference-only
         # decoder fast paths. Keyframe encoding remains FP32; decoder Linear
         # weights may be materialized in FP16 because reference decode casts
@@ -504,8 +512,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         mode: str = "tile",
         process_group: dist.ProcessGroup | None = None,
     ) -> None:
-        if mode != "tile":
-            raise ValueError(f"MiniMax H3 VAE supports its native tile parallel mode only, got {mode!r}")
+        if mode not in {"tile", "tensor"}:
+            raise ValueError(f"MiniMax H3 VAE supports tile or tensor parallel mode, got {mode!r}")
         group = process_group if process_group is not None else get_world_group().device_group
         world_size = dist.get_world_size(group)
         rank = dist.get_rank(group)
@@ -517,22 +525,28 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 f"({world_size}), got {parallel_size}"
             )
         self.parallel_size = parallel_size
-        enabled = parallel_size > 1
+        tensor_parallel = mode == "tensor"
+        if tensor_parallel and parallel_size != self.tensor_parallel_size:
+            raise ValueError("H3 VAE tensor-parallel weights and execution group must have the same size")
+        enabled = parallel_size > 1 and not tensor_parallel
 
         state = self._native_parallel_state()
         state.clear()
         state.update(
-            group_size=parallel_size,
+            group_size=parallel_size if enabled else 1,
             group_rank=rank if enabled else 0,
             local_process_group=group if enabled else None,
-            sp_size=parallel_size,
+            sp_size=parallel_size if enabled else 1,
             sp_rank=rank if enabled else 0,
             sp_enabled=enabled,
             sp_process_group=group if enabled else None,
-            tp_size=1,
-            tp_rank=0,
+            tp_size=parallel_size if tensor_parallel else 1,
+            tp_rank=rank if tensor_parallel else 0,
         )
         self.model.parallel_tiling = enabled
+        if tensor_parallel:
+            # All TP ranks decode the same tiles in the same order.
+            self.parallel_size = 1
 
     def _native_parallel_state(self) -> dict[str, Any]:
         """Return the checkpoint's own mutable parallel-state dict."""

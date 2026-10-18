@@ -1277,6 +1277,11 @@ class MiniMaxH3Pipeline(
                     if (model_path / "vae_decoder_nvfp4/decoder-nvfp4.safetensors").is_file()
                     else None,
                 ),
+                tensor_parallel_size=(
+                    int(self.parallel_config.vae_patch_parallel_size)
+                    if self.parallel_config.vae_parallel_mode == "tensor"
+                    else 1
+                ),
             )
             self.audio_vae = MiniMaxH3AudioVAE(
                 os.path.join(vae_model_path, "audio_vae"),

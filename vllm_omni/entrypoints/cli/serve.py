@@ -1093,10 +1093,11 @@ class OmniServeCommand(CLISubcommand):
             "--vae-parallel-mode",
             type=str,
             default="tile",
-            choices=["tile", "batch", "spatial_shard_height", "spatial_shard_width"],
+            choices=["tile", "batch", "tensor", "spatial_shard_height", "spatial_shard_width"],
             help="VAE parallel decode strategy for diffusion models. "
             "'tile' (default) uses patch/tile parallel decode; "
             "'batch' distributes complete images for AutoencoderKL/Flux2 with DP/PP/CFG sizes of 1; "
+            "'tensor' shards H3 video-decoder projections across the full DiT TP group; "
             "'spatial_shard_height'/'spatial_shard_width' use spatially-sharded decode that splits "
             "decoder feature maps along height/width and exchanges halo regions. The "
             "'spatial_shard_*' modes require vae_patch_parallel_size to match the DiT group size. "
