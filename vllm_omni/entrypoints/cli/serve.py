@@ -1119,6 +1119,13 @@ class OmniServeCommand(CLISubcommand):
             type=int,
             help="Maximum generated image size in pixels (height * width).",
         )
+        omni_config_group.add_argument(
+            "--max-generated-images",
+            default=10,
+            type=int,
+            choices=range(1, 11),
+            help="Maximum number of output images per request (n) for /v1/images/generations and /v1/images/edits.",
+        )
         # Diffusion model (mainly video generation models) streaming output mode
         omni_config_group.add_argument(
             "--diffusion-streaming-output",

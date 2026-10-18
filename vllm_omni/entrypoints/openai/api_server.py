@@ -139,6 +139,7 @@ from vllm_omni.entrypoints.openai.image_api_utils import (
 from vllm_omni.entrypoints.openai.images.helpers import (
     _build_hunyuan_edit_extra_args,
     _check_max_generated_image_size,
+    _check_max_generated_images,
     _choose_output_format,
     _extract_images_from_result,
     _generated_size_str,
@@ -2158,6 +2159,7 @@ async def generate_images(
     request_timestamp = float(getattr(raw_request.state, "request_timestamp", time.time()))
     # Get engine client (AsyncOmni) from app state
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
+    _check_max_generated_images(getattr(raw_request.app.state, "args", None), request.n)
 
     if request.model == "auto":
         request.model = None
@@ -2388,11 +2390,11 @@ async def edit_images(
     reference_image: str | UploadFile | None = None,
     # vllm-omni extensions for diffusion control
     negative_prompt: str | None = Form(None),
-    num_inference_steps: int | None = Form(None),
-    guidance_scale: float | None = Form(None),
+    num_inference_steps: int | None = Form(None, ge=1, le=200),
+    guidance_scale: float | None = Form(None, ge=0.0, le=20.0),
     guidance_scale_2: float | None = Form(None),
     strength: float | None = Form(None),
-    true_cfg_scale: float | None = Form(None),
+    true_cfg_scale: float | None = Form(None, ge=0.0, le=20.0),
     seed: int | None = Form(None),
     generator_device: str | None = Form(None),
     # vllm-omni extension for per-request LoRA.
@@ -2413,6 +2415,7 @@ async def edit_images(
     # 1. get engine and model
     request_timestamp = float(getattr(raw_request.state, "request_timestamp", time.time()))
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
+    _check_max_generated_images(getattr(raw_request.app.state, "args", None), n)
     if model == "auto":
         model = None
     if model is not None and model != model_name:

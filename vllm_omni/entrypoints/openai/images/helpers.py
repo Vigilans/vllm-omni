@@ -66,6 +66,17 @@ def _get_max_edit_input_images(raw_request: Request, engine_client: Any) -> int 
     return int(max_input_images)
 
 
+def _check_max_generated_images(app_state_args: Any, n: int) -> None:
+    """Validate the requested output count before image generation or input loading."""
+    limit = getattr(app_state_args, "max_generated_images", 10)
+    if not 1 <= n <= limit:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Requested n={n} images; this server allows 1 to {limit} images per request "
+            "(--max-generated-images).",
+        )
+
+
 def _check_max_generated_image_size(
     app_state_args: Any,
     width: int | None,

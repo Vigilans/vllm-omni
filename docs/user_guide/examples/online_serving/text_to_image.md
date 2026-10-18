@@ -17,6 +17,8 @@ vllm serve Qwen/Qwen-Image --omni --port 8091
 
 ### Start with Parameters
 
+Use `--max-generated-images 1` to allow one output image per request on `/v1/images/generations` and `/v1/images/edits`. The default is 10, and accepted limits are 1–10. Requests whose `n` exceeds the configured limit return HTTP 400 before generation. Combine it with `--max-generated-image-size` for a per-image pixel limit and `--max-num-seqs` for request concurrency.
+
 Or use the startup script:
 
 ```bash

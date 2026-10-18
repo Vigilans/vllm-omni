@@ -1152,6 +1152,44 @@ def test_generate_multiple_images(test_client):
         assert img.format == "PNG"
 
 
+@pytest.mark.parametrize("client_fixture", ["test_client", "async_omni_test_client"])
+@pytest.mark.parametrize("endpoint", ["generations", "edits"])
+def test_max_generated_images_rejects_before_generation(request, mocker, client_fixture, endpoint):
+    client = request.getfixturevalue(client_fixture)
+    client.app.state.args.max_generated_images = 1
+    load_images = mocker.patch("vllm_omni.entrypoints.openai.api_server._load_input_images", new=mocker.AsyncMock())
+
+    if endpoint == "generations":
+        response = client.post("/v1/images/generations", json={"prompt": "a cat", "n": 2})
+    else:
+        response = client.post(
+            "/v1/images/edits",
+            data={"prompt": "a cat", "n": 2, "url": "https://example.invalid/not-fetched.png"},
+        )
+
+    assert response.status_code == 400
+    assert "n=2" in response.json()["detail"]
+    assert "--max-generated-images" in response.json()["detail"]
+    assert client.app.state.engine_client.captured_prompt is None
+    load_images.assert_not_awaited()
+
+
+@pytest.mark.parametrize("endpoint", ["generations", "edits"])
+@pytest.mark.parametrize("limit,n", [(1, 1), (2, 2), (10, 10)])
+def test_max_generated_images_allows_boundary(test_client, endpoint, limit, n):
+    test_client.app.state.args.max_generated_images = limit
+    if endpoint == "generations":
+        response = test_client.post("/v1/images/generations", json={"prompt": "a cat", "n": n})
+    else:
+        response = test_client.post(
+            "/v1/images/edits",
+            files={"image": make_test_image_bytes((16, 16))},
+            data={"prompt": "a cat", "n": n},
+        )
+    assert response.status_code == 200
+    assert len(response.json()["data"]) == n
+
+
 def test_with_negative_prompt(test_client):
     """Test with negative prompt"""
     response = test_client.post(
@@ -1759,6 +1797,53 @@ def test_image_edit_ignores_mock_like_multimodal_limit(async_omni_test_client):
     processed_images = captured_prompt["multi_modal_data"]["img2img"]
     assert isinstance(processed_images, Image.Image)
     assert processed_images.size == (16, 16)
+
+
+@pytest.mark.parametrize("endpoint", ["generations", "edits"])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("num_inference_steps", 0),
+        ("num_inference_steps", 201),
+        ("true_cfg_scale", -0.1),
+        ("true_cfg_scale", 20.1),
+        ("guidance_scale", -0.1),
+        ("guidance_scale", 20.1),
+    ],
+)
+def test_image_sampling_bounds_reject_before_loading(test_client, mocker, endpoint, field, value):
+    load_images = mocker.patch("vllm_omni.entrypoints.openai.api_server._load_input_images", new=mocker.AsyncMock())
+    body = {"prompt": "a cat", field: value}
+    if endpoint == "generations":
+        response = test_client.post("/v1/images/generations", json=body)
+    else:
+        response = test_client.post(
+            "/v1/images/edits",
+            data={**body, "url": "https://example.invalid/not-fetched.png"},
+        )
+    assert response.status_code == 422
+    assert any(error["loc"][-1] == field for error in response.json()["detail"])
+    assert test_client.app.state.engine_client.captured_prompt is None
+    load_images.assert_not_awaited()
+
+
+@pytest.mark.parametrize("steps,cfg", [(1, 0.0), (40, 4.0), (200, 20.0)])
+def test_image_edit_sampling_bounds_allow_adjustable_cfg(test_client, steps, cfg):
+    response = test_client.post(
+        "/v1/images/edits",
+        files={"image": make_test_image_bytes((16, 16))},
+        data={
+            "prompt": "a cat",
+            "num_inference_steps": steps,
+            "true_cfg_scale": cfg,
+            "guidance_scale": cfg,
+        },
+    )
+    assert response.status_code == 200
+    sampling = test_client.app.state.engine_client.captured_sampling_params_list[0]
+    assert sampling.num_inference_steps == steps
+    assert sampling.true_cfg_scale == cfg
+    assert sampling.guidance_scale == cfg
 
 
 def test_image_edit_parameter_pass(async_omni_test_client):

@@ -217,6 +217,21 @@ def test_omni_serve_requires_model_when_none_provided() -> None:
         cmd.validate(args)
 
 
+@pytest.mark.parametrize("limit", [None, 1, 3, 10])
+def test_max_generated_images_parser(limit: int | None) -> None:
+    argv = ["serve", "fake-model", "--omni"]
+    if limit is not None:
+        argv += ["--max-generated-images", str(limit)]
+    args = _parse_serve_args(argv)
+    assert args.max_generated_images == (10 if limit is None else limit)
+
+
+@pytest.mark.parametrize("limit", [0, 11])
+def test_max_generated_images_parser_rejects_invalid_limit(limit: int) -> None:
+    with pytest.raises(SystemExit):
+        _parse_serve_args(["serve", "fake-model", "--omni", "--max-generated-images", str(limit)])
+
+
 @pytest.mark.parametrize(
     "argv",
     [
