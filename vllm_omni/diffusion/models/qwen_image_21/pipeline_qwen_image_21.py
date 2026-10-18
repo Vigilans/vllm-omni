@@ -9,6 +9,7 @@ import logging
 import os
 from collections import OrderedDict
 from collections.abc import Iterable
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
@@ -43,6 +44,12 @@ from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit import (
     retrieve_latents,
 )
 from vllm_omni.diffusion.models.qwen_image_21.cfg_parallel import QwenImage21CFGParallelMixin
+from vllm_omni.diffusion.models.qwen_image_21.comfy_checkpoint import (
+    encoder_name,
+    layer_metadata,
+    transformer_weights,
+    vae_weight,
+)
 from vllm_omni.diffusion.models.qwen_image_21.qwen_image_21_transformer import (
     QwenImage21KVCache,
     QwenImage21Transformer2DModel,
@@ -339,6 +346,17 @@ class QwenImage21Pipeline(
         # drives the schedule and its length decides the step count.
         sample_sigmas = od_config.extras.get("sample_sigmas")
         self.sample_sigmas = [float(s) for s in sample_sigmas] if sample_sigmas else None
+        self._comfy_transformer = od_config.model_paths.get("transformer")
+        self._comfy_encoder = od_config.model_paths.get("text_encoder")
+        self._comfy_vae = od_config.model_paths.get("vae")
+        transformer_quant_config = resolve_component_quant_config(od_config.quantization_config, "transformer")
+        if self._comfy_transformer:
+            if transformer_quant_config is None or transformer_quant_config.get_name() != "int8_convrot":
+                raise ValueError("A Comfy Qwen-Image-2.1 transformer requires int8_convrot quantization")
+            transformer_quant_config.configure_layers({
+                "transformer." + name: metadata
+                for name, metadata in layer_metadata(self._comfy_transformer, transformer=True).items()
+            })
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
@@ -369,6 +387,11 @@ class QwenImage21Pipeline(
         # Unlike the 2.0 T2I pipeline, the vision tower is required: condition
         # images are encoded jointly with the prompt by the VLM.
         text_encoder_quant_config = _resolve_text_encoder_quant_config(od_config.quantization_config)
+        if self._comfy_encoder:
+            from vllm_omni.quantization.comfy_mixed_config import ComfyMixedConfig
+
+            encoder_metadata = layer_metadata(self._comfy_encoder)
+            text_encoder_quant_config = ComfyMixedConfig(encoder_metadata)
         if text_encoder_quant_config is None:
             self.text_encoder = from_pretrained_with_prefetch(
                 Qwen3VLForConditionalGeneration.from_pretrained,
@@ -388,13 +411,26 @@ class QwenImage21Pipeline(
             )
             encoder_od_config = dataclasses.replace(
                 od_config,
-                quantization_config=_exclude_text_encoder_subtrees_from_quant(text_encoder_quant_config),
+                quantization_config=(
+                    text_encoder_quant_config if self._comfy_encoder
+                    else _exclude_text_encoder_subtrees_from_quant(text_encoder_quant_config)
+                ),
             )
             self.text_encoder = create_transformers_model(
                 AutoModelForImageTextToText,
                 encoder_od_config,
                 hf_config=text_encoder_config,
             ).to(self.device)
+            if self._comfy_encoder:
+                from vllm_omni.quantization.comfy_mixed_config import ComfyInt8Embedding
+
+                embedding = self.text_encoder.get_input_embeddings()
+                self.text_encoder.set_input_embeddings(
+                    ComfyInt8Embedding(
+                        embedding.num_embeddings, embedding.embedding_dim,
+                        encoder_metadata["model.language_model.embed_tokens"], od_config.dtype,
+                    ).to(self.device)
+                )
             self.weights_sources.append(
                 DiffusersPipelineLoader.ComponentSource(
                     model_or_path=model,
@@ -403,19 +439,43 @@ class QwenImage21Pipeline(
                     prefix="text_encoder.",
                 )
             )
-        self.vae = from_pretrained_with_prefetch(
-            DistributedAutoencoderKLQwenImage21.from_pretrained,
-            model,
-            subfolder="vae",
-            prefetch_list=qwen_subfolders,
-            local_files_only=local_files_only,
-        ).to(self.device)
+        if self._comfy_vae:
+            vae_config = DistributedAutoencoderKLQwenImage21.load_config(model, subfolder="vae")
+            self.vae = DistributedAutoencoderKLQwenImage21.from_config(vae_config).to(self.device)
+            self.vae.init_distributed()
+            self.weights_sources.append(
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=model, subfolder="vae", revision=None, prefix="vae."
+                )
+            )
+        else:
+            self.vae = from_pretrained_with_prefetch(
+                DistributedAutoencoderKLQwenImage21.from_pretrained,
+                model,
+                subfolder="vae",
+                prefetch_list=qwen_subfolders,
+                local_files_only=local_files_only,
+            ).to(self.device)
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, QwenImage21Transformer2DModel)
         self.transformer = QwenImage21Transformer2DModel(
             od_config=od_config,
-            quant_config=resolve_component_quant_config(od_config.quantization_config, "transformer"),
+            quant_config=transformer_quant_config,
             **transformer_kwargs,
         )
+        if self._comfy_transformer:
+            transformer_quant_config.validate_model_bindings(self.transformer)
+        for component, checkpoint in (
+            ("transformer", self._comfy_transformer), ("text_encoder", self._comfy_encoder), ("vae", self._comfy_vae)
+        ):
+            if checkpoint:
+                path = Path(checkpoint)
+                self.weights_sources = [
+                    DiffusersPipelineLoader.ComponentSource(
+                        model_or_path=str(path.parent), subfolder=None, revision=None,
+                        prefix=component + ".", fall_back_to_pt=False, allow_patterns_overrides=[path.name],
+                    ) if source.prefix == component + "." else source
+                    for source in self.weights_sources
+                ]
         self.processor = from_pretrained_with_prefetch(
             Qwen3VLProcessor.from_pretrained,
             model,
@@ -1651,5 +1711,19 @@ class QwenImage21Pipeline(
         return self._decode_latents(state.latents, height, width, output_type)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        def mapped_weights():
+            for name, tensor in weights:
+                if name.endswith(".comfy_quant"):
+                    continue
+                if self._comfy_encoder and name.startswith("text_encoder."):
+                    name = "text_encoder." + encoder_name(name.removeprefix("text_encoder."))
+                elif self._comfy_vae and name.startswith("vae."):
+                    name, tensor = vae_weight(name.removeprefix("vae."), tensor)
+                    name = "vae." + name
+                if self._comfy_transformer and name.startswith("transformer."):
+                    yield from transformer_weights(name, tensor)
+                else:
+                    yield name, tensor
+
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        return loader.load_weights(mapped_weights())
