@@ -38,6 +38,11 @@ def _blackwell_sm120(monkeypatch: pytest.MonkeyPatch, *, cudnn_version: int = 90
         classmethod(lambda cls, device_id=0: DeviceCapability(12, 0)),
     )
     monkeypatch.setattr(PACKAGES_CHECKER, "get_packages_info", lambda: {"has_flash_attn": False})
+    monkeypatch.setattr(
+        CudaOmniPlatform,
+        "has_flash_attn_package",
+        classmethod(lambda cls: PACKAGES_CHECKER.get_packages_info()["has_flash_attn"]),
+    )
     monkeypatch.setattr(CudaOmniPlatform, "has_flash_attn_4", classmethod(lambda cls: False))
     monkeypatch.setattr(torch.backends.cudnn, "version", lambda: cudnn_version)
 
@@ -181,12 +186,21 @@ def test_auto_selects_cudnn_for_unknown_head_size_probe(monkeypatch: pytest.Monk
     assert path == DiffusionAttentionBackendEnum.CUDNN_ATTN.get_path()
 
 
-def test_explicit_flash_attn_rejects_blackwell_without_fa4(monkeypatch: pytest.MonkeyPatch):
+def test_explicit_flash_attn_rejects_blackwell_without_compatible_implementation(monkeypatch: pytest.MonkeyPatch):
     _blackwell_sm120(monkeypatch)
-    monkeypatch.setattr(PACKAGES_CHECKER, "get_packages_info", lambda: {"has_flash_attn": True})
 
     with pytest.raises(ValueError, match="requires CuTe FlashAttention-4"):
         CudaOmniPlatform.get_diffusion_attn_backend_cls("FLASH_ATTN", head_size=64)
+
+
+def test_explicit_flash_attn_accepts_sm120_with_vllm_fa2(monkeypatch: pytest.MonkeyPatch):
+    _blackwell_sm120(monkeypatch)
+    monkeypatch.setattr(PACKAGES_CHECKER, "get_packages_info", lambda: {"has_flash_attn": True})
+
+    path = CudaOmniPlatform.get_diffusion_attn_backend_cls("FLASH_ATTN", head_size=128)
+
+    assert path == DiffusionAttentionBackendEnum.FLASH_ATTN.get_path()
+    assert CudaOmniPlatform.supports_diffusion_dense_flash_attention() is True
 
 
 def test_explicit_flash_attn_accepts_blackwell_when_fa4_available(monkeypatch: pytest.MonkeyPatch):

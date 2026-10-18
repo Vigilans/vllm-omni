@@ -17,7 +17,7 @@
 # Adapted from https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_flash_attention_utils.py
 import inspect
 from collections.abc import Callable
-from functools import cache, lru_cache
+from functools import cache, lru_cache, partial
 from typing import Any
 
 import torch
@@ -136,11 +136,21 @@ elif current_omni_platform.is_musa():
         pass
 else:
     # CUDA implementation candidates, ordered by preference.
-    # Candidate 1: CuTe-based FA4. This matters on Blackwell, where an
-    # importable Hopper-only FA3 wheel may otherwise be selected and fail
-    # at launch with "no kernel image is available".
+    # Consumer Blackwell uses vLLM's supported FA2 build. Datacenter
+    # Blackwell uses the CuTe implementation.
     if _is_blackwell():
-        if is_flash_attn_4_available():
+        capability = current_omni_platform.get_device_capability()
+        if capability is not None and capability.major == 12:
+            try:
+                from vllm.vllm_flash_attn import flash_attn_varlen_func as _vllm_fa_varlen
+                from vllm.vllm_flash_attn.flash_attn_interface import is_fa_version_supported
+
+                if is_fa_version_supported(2):
+                    flash_attn_varlen_func = partial(_vllm_fa_varlen, fa_version=2)
+                    logger.info("Using vLLM-bundled FlashAttention-2 on SM12x")
+            except (ImportError, ModuleNotFoundError):
+                pass
+        if flash_attn_varlen_func is None and is_flash_attn_4_available():
             try:
                 from flash_attn.cute import flash_attn_func as _fa_func
                 from flash_attn.cute import flash_attn_varlen_func as _fa_varlen

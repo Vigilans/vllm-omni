@@ -61,8 +61,10 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
 
     @classmethod
     def supports_diffusion_dense_flash_attention(cls) -> bool:
-        """Dense FLASH_ATTN is FA4 on Blackwell; FA2/FA3 on older CUDA GPUs."""
+        """Resolve dense FLASH_ATTN support for the current CUDA family."""
         capability = cls.get_device_capability()
+        if capability is not None and capability.major == 12:
+            return cls.has_flash_attn_package() or cls.has_flash_attn_4()
         if capability is not None and capability.major in (10, 11, 12):
             return cls.has_flash_attn_4()
         return cls.has_flash_attn_package()
@@ -77,8 +79,8 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
         from vllm_omni.diffusion.envs import PACKAGES_CHECKER
 
         # Check compute capability for Flash Attention support.
-        # FA requires sm_80+. Blackwell (sm_10x/sm_12x) only works with FA builds
-        # that include the Blackwell CUTE kernel — plain FA2 will crash there.
+        # FA requires sm_80+. Consumer Blackwell can use vLLM's supported FA2
+        # build; datacenter Blackwell uses CuTe FA4.
         #
         # Known Blackwell SKUs:
         #   sm_100 = B200 / GB200 (datacenter)
@@ -107,12 +109,11 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
         packages_info = PACKAGES_CHECKER.get_packages_info()
         packages_available = packages_info.get("has_flash_attn", False)
 
-        # FA2/FA3 wheels are often importable on Blackwell but only ship
-        # Ampere/Ada/Hopper kernels; the first forward then dies with
-        # "no kernel image". FA4 (flash_attn.cute / vllm-omni[fa4]) is the
-        # FLASH_ATTN implementation that actually runs on Blackwell.
+        # Package discovery binds a hardware-compatible implementation.
         if is_blackwell:
-            flash_attn_supported = compute_supported and cls.has_flash_attn_4()
+            flash_attn_supported = compute_supported and (
+                cls.has_flash_attn_4() or (compute_capability.major == 12 and packages_available)
+            )
         else:
             flash_attn_supported = compute_supported and packages_available
 
@@ -254,8 +255,8 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
             if backend_upper == "FLASH_ATTN" and not flash_attn_supported:
                 if is_blackwell:
                     reason = (
-                        "Blackwell requires CuTe FlashAttention-4 "
-                        "(flash_attn.cute / vllm-omni[fa4]); FA2/FA3 kernels are Hopper-only"
+                        "Blackwell requires CuTe FlashAttention-4 or, on SM12x, "
+                        "a supported vLLM-bundled FlashAttention-2 build"
                     )
                 elif not compute_supported:
                     reason = "compute capability < 8.0"
