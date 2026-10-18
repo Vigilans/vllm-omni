@@ -766,6 +766,62 @@ def test_convrot_rejects_resolved_fasth3_fusion(monkeypatch, mocker, tmp_path):
     resolve_fusion.assert_called_once_with(od_config, transformer)
 
 
+def test_combined_convrot_keeps_checkpoint_metadata_separate(monkeypatch, mocker, tmp_path):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline
+    from vllm_omni.diffusion.models.minimax_h3.comfy_checkpoint import MiniMaxH3ComfyCheckpoint
+    from vllm_omni.quantization.int8_convrot_config import DiffusionInt8ConvRotConfig, Int8ConvRotLayerConfig
+
+    for partition in ("FL2VA", "Ref2VA"):
+        model_path = tmp_path / partition
+        model_path.mkdir()
+        (model_path / "model_index.json").write_text(
+            json.dumps({"_minimax_h3": {"partition": partition.lower()}})
+        )
+    fl_path = tmp_path / "fl2va.safetensors"
+    ref_path = tmp_path / "ref2va.safetensors"
+    fl_layers = {"blocks.0.attn.out_proj": Int8ConvRotLayerConfig(convrot=True)}
+    ref_layers = {"blocks.0.attn.out_proj": Int8ConvRotLayerConfig(convrot=False)}
+    checkpoints = {
+        fl_path: MiniMaxH3ComfyCheckpoint(fl_layers, 3, 2),
+        ref_path: MiniMaxH3ComfyCheckpoint(ref_layers, 5, 4),
+    }
+    od_config = OmniDiffusionConfig(
+        model=str(tmp_path),
+        task_type="combined",
+        model_loaded={"text_encoder": False},
+        model_paths={"transformer": str(fl_path), "transformers_ref": str(ref_path)},
+        quantization_config=DiffusionInt8ConvRotConfig(),
+    )
+    monkeypatch.setattr(pipeline, "get_local_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(pipeline, "_dit_rank_world", lambda: (None, 0, 1))
+    mocker.patch.object(pipeline, "resolve_comfy_checkpoint_path", side_effect=lambda path: type(fl_path)(path))
+    inspect_checkpoint = mocker.patch.object(
+        pipeline, "inspect_comfy_checkpoint", side_effect=lambda path, **kwargs: checkpoints[path]
+    )
+    construct_dit = mocker.patch.object(pipeline, "MiniMaxH3DiTModel", side_effect=lambda *args, **kwargs: nn.Module())
+    mocker.patch.object(pipeline, "resolve_fasth3_fusion", return_value=None)
+    mocker.patch.object(pipeline, "MiniMaxH3VideoVAE", return_value=nn.Module())
+    mocker.patch.object(pipeline, "MiniMaxH3AudioVAE", return_value=nn.Module())
+    mocker.patch.object(pipeline.MiniMaxH3Pipeline, "setup_diffusion_pipeline_profiler")
+
+    model = pipeline.MiniMaxH3Pipeline(od_config=od_config)
+
+    fl_kwargs, ref_kwargs = [call.kwargs for call in construct_dit.call_args_list]
+    assert fl_kwargs["quant_config"] is not ref_kwargs["quant_config"]
+    assert fl_kwargs["quant_config"].layer_configs == fl_layers
+    assert ref_kwargs["quant_config"].layer_configs == ref_layers
+    assert fl_kwargs["arch_overrides"] == {"adaln_curve_grid": 3, "adaln_curve_dim": 2}
+    assert ref_kwargs["arch_overrides"] == {"adaln_curve_grid": 5, "adaln_curve_dim": 4}
+    assert [call.kwargs["expected_partition"] for call in inspect_checkpoint.call_args_list] == ["fl2va", "ref2va"]
+    assert [(source.prefix, source.allow_patterns_overrides) for source in model.weights_sources] == [
+        ("transformer.", [fl_path.name]),
+        ("transformers_ref.", [ref_path.name]),
+    ]
+    assert model._transformer_for_task("fl2va") is model.transformer
+    assert model._transformer_for_task("ref2va") is model.transformers_ref
+
+
 def test_adaln_curve_model_interpolates_without_dense_time_embedder(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
 

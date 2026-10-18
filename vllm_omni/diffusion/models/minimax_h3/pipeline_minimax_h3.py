@@ -10,6 +10,7 @@ import os
 from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
+from copy import deepcopy
 from dataclasses import fields, replace
 from itertools import groupby
 from pathlib import Path
@@ -275,14 +276,13 @@ def _resolve_minimax_h3_model_root(
             return path.parent
         return path
     if skip_transformer:
-        if partition == "combined":
-            raise ValueError("A MiniMax-H3 transformer override does not support combined mode.")
-        prefix = {"fl2va": "FL2VA", "ref2va": "Ref2VA"}[partition]
+        prefix_by_partition = {"fl2va": "FL2VA", "ref2va": "Ref2VA"}
+        prefixes = prefix_by_partition.values() if partition == "combined" else (prefix_by_partition[partition],)
         components = ["model_index.json"]
         if load_text_encoder:
             components.extend(["tokenizer/**", "processor/**", "text_encoder/**"])
         components.extend(["transformer/config.json", "video_vae/**", "audio_vae/**"])
-        allow_patterns = [f"{prefix}/{component}" for component in components]
+        allow_patterns = [f"{prefix}/{component}" for prefix in prefixes for component in components]
     elif is_minimax_h3_modular(model, revision):
         from vllm_omni.model_executor.models.minimax_h3.checkpoint import minimax_h3_transformer_subfolder
 
@@ -973,6 +973,11 @@ class MiniMaxH3Pipeline(
         self._native_lora_adapter_ids: set[int] = set()
         self._lora_sigma_schedules: dict[int, DMD2SigmaSchedule] = {}
         transformer_override = od_config.model_paths.get("transformer")
+        ref_transformer_override = od_config.model_paths.get("transformers_ref")
+        if ref_transformer_override and self.partition != "combined":
+            raise ValueError('model_paths["transformers_ref"] requires the combined MiniMax-H3 partition.')
+        if self.partition == "combined" and bool(transformer_override) != bool(ref_transformer_override):
+            raise ValueError("Combined MiniMax-H3 checkpoint overrides require both transformer and transformers_ref.")
         if transformer_override and bool(getattr(self.parallel_config, "use_hsdp", False)):
             raise ValueError("MiniMax-H3 INT8 ConvRot currently supports tensor parallelism, not HSDP/FSDP.")
         model_root = _resolve_minimax_h3_model_root(
@@ -1049,13 +1054,11 @@ class MiniMaxH3Pipeline(
             bool(transformer_override),
             transformer_quant_config,
         )
+        ref_transformer_quant_config = (
+            deepcopy(transformer_quant_config) if ref_transformer_override else transformer_quant_config
+        )
         transformer_checkpoint: MiniMaxH3ComfyCheckpoint | None = None
         if transformer_override:
-            if self.partition == "combined":
-                raise ValueError(
-                    "A Comfy MiniMax-H3 transformer override currently supports one partition at a time; "
-                    "start FL2VA or Ref2VA instead of combined mode."
-                )
             checkpoint_path = resolve_comfy_checkpoint_path(transformer_override)
             transformer_checkpoint = inspect_comfy_checkpoint(
                 checkpoint_path,
@@ -1086,16 +1089,38 @@ class MiniMaxH3Pipeline(
                 )
             ]
         self._dit_modules = ["transformer"]
+        ref_transformer_checkpoint: MiniMaxH3ComfyCheckpoint | None = None
         if ref2va_model_path is not None:
-            self.weights_sources.append(
-                DiffusersPipelineLoader.ComponentSource(
-                    model_or_path=str(ref2va_model_path),
-                    subfolder="transformer",
-                    revision=od_config.revision,
-                    prefix="transformers_ref.",
-                    fall_back_to_pt=False,
+            if ref_transformer_override:
+                ref_checkpoint_path = resolve_comfy_checkpoint_path(ref_transformer_override)
+                ref_transformer_checkpoint = inspect_comfy_checkpoint(
+                    ref_checkpoint_path,
+                    expected_partition="ref2va",
                 )
-            )
+                configure_ref_layers = getattr(ref_transformer_quant_config, "configure_layers", None)
+                if configure_ref_layers is None:
+                    raise TypeError("The active int8_convrot config cannot consume checkpoint layer metadata.")
+                configure_ref_layers(ref_transformer_checkpoint.layer_configs)
+                self.weights_sources.append(
+                    DiffusersPipelineLoader.ComponentSource(
+                        model_or_path=str(ref_checkpoint_path.parent),
+                        subfolder=None,
+                        revision=None,
+                        prefix="transformers_ref.",
+                        fall_back_to_pt=False,
+                        allow_patterns_overrides=[ref_checkpoint_path.name],
+                    )
+                )
+            else:
+                self.weights_sources.append(
+                    DiffusersPipelineLoader.ComponentSource(
+                        model_or_path=str(ref2va_model_path),
+                        subfolder="transformer",
+                        revision=od_config.revision,
+                        prefix="transformers_ref.",
+                        fall_back_to_pt=False,
+                    )
+                )
             self._dit_modules.append("transformers_ref")
         from vllm_omni.quantization.fp8_config import SerializedPerChannelFp8Config
 
@@ -1156,8 +1181,11 @@ class MiniMaxH3Pipeline(
         if ref2va_model_path is not None:
             self.transformers_ref = MiniMaxH3DiTModel(
                 od_config,
-                quant_config=transformer_quant_config,
+                quant_config=ref_transformer_quant_config,
                 diffusers_weights=modular,
+                arch_overrides=(
+                    ref_transformer_checkpoint.arch_overrides if ref_transformer_checkpoint is not None else None
+                ),
             )
 
         self._vdn = VDNCheckpoint.from_od_config(od_config, self.transformer)
