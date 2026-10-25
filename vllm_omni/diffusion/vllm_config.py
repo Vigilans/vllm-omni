@@ -94,6 +94,7 @@ class _DiffusionVllmModelConfig:
     # model configuration object in the Worker backend.
     is_mm_prefix_lm: bool = False
     rswa_window: int | None = None
+    supports_kv_cache_grouping: bool = False
     _attention_num_heads: int | None = field(default=None, init=False, repr=False)
     _attention_num_kv_heads: int | None = field(default=None, init=False, repr=False)
     _attention_head_size: int | None = field(default=None, init=False, repr=False)
